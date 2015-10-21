@@ -32,8 +32,8 @@ namespace Cassandra
         {
             var bigintBytes = new byte[decimalBuf.Length - 4];
             Array.Copy(decimalBuf, 4, bigintBytes, 0, bigintBytes.Length);
-
-            var scale = (byte)TypeCodec.BytesToInt32(decimalBuf, 0);
+            //Scale greater than 127 will fail
+            var scale = (byte)BeConverter.ToInt32(decimalBuf, 0);
 
             Array.Reverse(bigintBytes);
             var bigInteger = new BigInteger(bigintBytes);
@@ -63,8 +63,7 @@ namespace Cassandra
 
             int scale = (bits[3] >> 16) & 31;
 
-            byte[] scaleBytes = BitConverter.GetBytes(scale);
-            Array.Reverse(scaleBytes);
+            byte[] scaleBytes = BeConverter.GetBytes(scale);
 
             var bigintBytes = new byte[13]; // 13th byte is for making sure that the number is positive
             Buffer.BlockCopy(bits, 0, bigintBytes, 0, 12);

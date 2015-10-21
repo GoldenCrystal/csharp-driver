@@ -26,6 +26,8 @@ using System.Threading.Tasks;
 using Cassandra.Tasks;
 using Cassandra.Compression;
 using Cassandra.Requests;
+using Cassandra.Responses;
+using Microsoft.IO;
 
 namespace Cassandra
 {
@@ -55,16 +57,17 @@ namespace Cassandra
         private ConcurrentDictionary<short, OperationState> _pendingOperations;
         /// <summary> It contains the requests that could not be written due to streamIds not available</summary>
         private ConcurrentQueue<OperationState> _writeQueue;
-        private volatile OperationState _receivingOperation;
         /// <summary>
         /// Small buffer (less than 8 bytes) that is used when the next received message is smaller than 8 bytes, 
         /// and it is not possible to read the header.
         /// </summary>
         private volatile byte[] _minimalBuffer;
+        private readonly byte[] _decompressorBuffer = new byte[1024];
         private volatile string _keyspace;
         private readonly SemaphoreSlim _keyspaceSwitchSemaphore = new SemaphoreSlim(1);
         private volatile Task<bool> _keyspaceSwitchTask;
         private volatile byte _frameHeaderSize;
+        private MemoryStream _readStream;
         /// <summary> TaskScheduler used to handle write tasks</summary>
         private readonly TaskScheduler _writeScheduler = new LimitedParallelismTaskScheduler(1);
         private int _isWriteQueueRuning;
@@ -160,6 +163,14 @@ namespace Cassandra
 
         public Connection(byte protocolVersion, IPEndPoint endpoint, Configuration configuration)
         {
+            if (configuration == null)
+            {
+                throw new ArgumentNullException("configuration");
+            }
+            if (configuration.BufferPool == null)
+            {
+                throw new ArgumentNullException(null, "BufferPool can not be null");
+            }
             ProtocolVersion = protocolVersion;
             Configuration = configuration;
             _tcpSocket = new TcpSocket(endpoint, configuration.SocketOptions, configuration.ProtocolOptions.SslOptions);
@@ -170,7 +181,7 @@ namespace Cassandra
         /// Starts the authentication flow
         /// </summary>
         /// <exception cref="AuthenticationException" />
-        private Task<AbstractResponse> Authenticate()
+        private Task<Response> Authenticate()
         {
             //Determine which authentication flow to use.
             //Check if its using a C* 1.2 with authentication patched version (like DSE 3.1)
@@ -209,7 +220,7 @@ namespace Cassandra
         }
 
         /// <exception cref="AuthenticationException" />
-        private Task<AbstractResponse> Authenticate(byte[] token, IAuthenticator authenticator)
+        private Task<Response> Authenticate(byte[] token, IAuthenticator authenticator)
         {
             var request = new AuthResponseRequest(ProtocolVersion, token);
             return Send(request)
@@ -300,9 +311,14 @@ namespace Cassandra
             _idleTimer.Dispose();
             _tcpSocket.Dispose();
             _keyspaceSwitchSemaphore.Dispose();
+            var readStream = Interlocked.Exchange(ref _readStream, null);
+            if (readStream != null)
+            {
+                readStream.Close();
+            }
         }
 
-        private void EventHandler(Exception ex, AbstractResponse response)
+        private void EventHandler(Exception ex, Response response)
         {
             if (!(response is EventResponse))
             {
@@ -359,7 +375,7 @@ namespace Cassandra
         /// <exception cref="SocketException">Throws a SocketException when the connection could not be established with the host</exception>
         /// <exception cref="AuthenticationException" />
         /// <exception cref="UnsupportedProtocolVersionException"></exception>
-        public Task<AbstractResponse> Open()
+        public Task<Response> Open()
         {
             _freeOperations = new ConcurrentStack<short>(Enumerable.Range(0, MaxConcurrentRequests).Select(s => (short)s).Reverse());
             _pendingOperations = new ConcurrentDictionary<short, OperationState>();
@@ -444,7 +460,7 @@ namespace Cassandra
             }
             //We are currently using an IO Thread
             //Parse the data received
-            var streamIdAvailable = ReadParse(buffer, 0, bytesReceived);
+            var streamIdAvailable = ReadParse(buffer, bytesReceived);
             if (!streamIdAvailable)
             {
                 return;
@@ -458,110 +474,168 @@ namespace Cassandra
             RunQueue(false);
         }
 
+        private volatile FrameHeader _receivingHeader;
+
         /// <summary>
         /// Parses the bytes received into a frame. Uses the internal operation state to do the callbacks.
         /// Returns true if a full operation (streamId) has been processed and there is one available.
         /// </summary>
-        /// <param name="buffer">Byte buffer to read</param>
-        /// <param name="offset">Offset within the buffer</param>
-        /// <param name="count">Length of bytes to be read from the buffer</param>
         /// <returns>True if a full operation (streamId) has been processed.</returns>
-        protected virtual bool ReadParse(byte[] buffer, int offset, int count)
+        internal bool ReadParse(byte[] buffer, int length)
         {
-            var state = _receivingOperation;
-            if (state == null)
+            if (length <= 0)
             {
-                if (_minimalBuffer != null)
+                return false;
+            }
+            if (_frameHeaderSize == 0)
+            {
+                //Read the first byte of the message to determine the version of the response
+                ProtocolVersion = FrameHeader.GetProtocolVersion(buffer);
+                _frameHeaderSize = FrameHeader.GetSize(ProtocolVersion);
+            }
+            //Use _readStream to buffer between messages, under low pressure, it should be null most of the times
+            var stream = Interlocked.Exchange(ref _readStream, null);
+            var operationCallbacks = new LinkedList<Action<MemoryStream>>();
+            var offset = 0;
+            if (_minimalBuffer != null)
+            {
+                //use a negative offset to identify that there is a previous header buffer
+                offset = -1 * _minimalBuffer.Length;
+            }
+            while (offset < length)
+            {
+                FrameHeader header;
+                //The remaining body length to read from this buffer
+                int remainingBodyLength;
+                if (_receivingHeader == null)
                 {
-                    buffer = Utils.JoinBuffers(_minimalBuffer, 0, _minimalBuffer.Length, buffer, offset, count);
-                    offset = 0;
-                    count = buffer.Length;
+                    if (length - offset < _frameHeaderSize)
+                    {
+                        _minimalBuffer = offset >= 0 ?
+                            Utils.SliceBuffer(buffer, offset, length - offset) :
+                            //it should almost never be the case there isn't enough bytes to read the header more than once
+                            // ReSharper disable once PossibleNullReferenceException
+                            Utils.JoinBuffers(_minimalBuffer, 0, _minimalBuffer.Length, buffer, 0, length);
+                        break;
+                    }
+                    if (offset >= 0)
+                    {
+                        header = FrameHeader.ParseResponseHeader(ProtocolVersion, buffer, offset);
+                    }
+                    else
+                    {
+                        header = FrameHeader.ParseResponseHeader(ProtocolVersion, _minimalBuffer, buffer);
+                        _minimalBuffer = null;
+                    }
+                    offset += _frameHeaderSize;
+                    remainingBodyLength = header.BodyLength;
                 }
-                if (_frameHeaderSize == 0)
+                else
                 {
-                    //Read the first byte of the message to determine the version of the response
-                    ProtocolVersion = FrameHeader.GetProtocolVersion(buffer);
-                    _frameHeaderSize = FrameHeader.GetSize(ProtocolVersion);
+                    header = _receivingHeader;
+                    remainingBodyLength = header.BodyLength - (int) stream.Length;
+                    _receivingHeader = null;
                 }
-                var headerSize = _frameHeaderSize;
-                if (count < headerSize)
+                if (remainingBodyLength > length - offset)
                 {
-                    //There is not enough data to read the header
-                    _minimalBuffer = Utils.SliceBuffer(buffer, offset, count);
-                    return false;
+                    //the buffer does not contains the body for this frame, buffer for later
+                    MemoryStream nextMessageStream;
+                    if (operationCallbacks.Count == 0 && stream != null)
+                    {
+                        //There hasn't been any operations completed with this buffer
+                        //And there is a previous stream: reuse it
+                        nextMessageStream = stream;
+                    }
+                    else
+                    {
+                        nextMessageStream = Configuration.BufferPool.GetStream(typeof(Connection) + "/Read");
+                    }
+                    nextMessageStream.Write(buffer, offset, length - offset);
+                    Interlocked.Exchange(ref _readStream, nextMessageStream);
+                    _receivingHeader = header;
+                    break;
                 }
-                _minimalBuffer = null;
-                var header = FrameHeader.ParseResponseHeader(ProtocolVersion, buffer, offset);
-                if (!header.IsValidResponse())
-                {
-                    _logger.Error("Not a response header");
-                }
-                offset += headerSize;
-                count -= headerSize;
+                stream = stream ?? Configuration.BufferPool.GetStream(typeof (Connection) + "/Read");
+                OperationState state;
                 if (header.Opcode != EventResponse.OpCode)
                 {
-                    //Its a response to a previous request
-                    state = _pendingOperations[header.StreamId];
+                    state = RemoveFromPending(header.StreamId);
                 }
                 else
                 {
                     //Its an event
-                    state = new OperationState(EventHandler, Configuration.BufferPool);
+                    state = new OperationState(EventHandler);
                 }
-                state.Header = header;
-                _receivingOperation = state;
+                stream.Write(buffer, offset, remainingBodyLength);
+                var callback = state.SetCompleted();
+                operationCallbacks.AddLast(CreateCallbackAction(header, callback));
+                offset += remainingBodyLength;
             }
-            var countAdded = state.AppendBody(buffer, offset, count);
-
-            if (!state.IsBodyComplete)
+            if (operationCallbacks.Count == 0)
             {
-                //Nothing finished
+                //Not enough data to read a frame
                 return false;
             }
-            _logger.Verbose("Read #{0} for Opcode {1} from host {2}", state.Header.StreamId, state.Header.Opcode, Address);
-            //Stop reference it as the current receiving operation
-            _receivingOperation = null;
-            if (state.Header.Opcode != EventResponse.OpCode)
+            //Invoke all callbacks using the default TaskScheduler
+            Task.Factory.StartNew(() =>
             {
-                RemoveFromPending(state.Header.StreamId);
-            }
-            try
-            {
-                var response = ReadParseResponse(state.Header, state.BodyStream);
-                state.InvokeCallback(null, response);
-            }
-            catch (Exception ex)
-            {
-                state.InvokeCallback(ex);
-            }
-
-            if (countAdded < count)
-            {
-                //There is more data, from the next frame
-                ReadParse(buffer, offset + countAdded, count - countAdded);
-            }
+                // ReSharper disable once PossibleNullReferenceException
+                stream.Position = 0;
+                foreach (var cb in operationCallbacks)
+                {
+                    cb(stream);
+                }
+                stream.Dispose();
+            }, CancellationToken.None, TaskCreationOptions.None, TaskScheduler.Default);
             return true;
-            //There isn't enough data to read the whole frame.
-            //It is already buffered, carry on.
         }
 
-        private AbstractResponse ReadParseResponse(FrameHeader header, Stream body)
+        /// <summary>
+        /// Returns an action that capture the parameters closure
+        /// </summary>
+        private Action<MemoryStream> CreateCallbackAction(FrameHeader header, Action<Exception, Response> callback)
         {
-            //Start at the first byte
-            body.Position = 0;
-            if ((header.Flags & FrameHeader.HeaderFlag.Compression) != 0)
+            var compressor = Compressor;
+            var bufferPool = Configuration.BufferPool;
+            var decompressorBuffer = _decompressorBuffer;
+            return stream =>
             {
-                body = Compressor.Decompress(body);
-            }
-            var frame = new ResponseFrame(header, body);
-            var response = FrameParser.Parse(frame);
-            return response;
+                Response response = null;
+                Exception ex = null;
+                var nextPosition = stream.Position + header.BodyLength;
+                try
+                {
+                    Stream plainTextStream = stream;
+                    if (header.Flags.HasFlag(FrameHeader.HeaderFlag.Compression))
+                    {
+                        var compressedBodyStream = bufferPool.GetStream(typeof (Connection) + "/Decompress", header.BodyLength);
+                        Utils.CopyStream(stream, compressedBodyStream, header.BodyLength, decompressorBuffer);
+                        compressedBodyStream.Position = 0;
+                        plainTextStream = compressor.Decompress(compressedBodyStream);
+                        plainTextStream.Position = 0;
+                    }
+                    response = FrameParser.Parse(new Frame(header, plainTextStream));
+                }
+                catch (Exception catchedException)
+                {
+                    ex = catchedException;
+                }
+                if (response is ErrorResponse)
+                {
+                    //Create an exception from the response error
+                    ex = ((ErrorResponse)response).Output.CreateException();
+                    response = null;
+                }
+                //We must advance the position of the stream manually in case it was not correctly parsed
+                stream.Position = nextPosition;
+                callback(ex, response);
+            };
         }
 
         /// <summary>
         /// Sends a protocol STARTUP message
         /// </summary>
-        private Task<AbstractResponse> Startup()
+        private Task<Response> Startup()
         {
             var startupOptions = new Dictionary<string, string>();
             startupOptions.Add("CQL_VERSION", "3.0.0");
@@ -574,7 +648,7 @@ namespace Cassandra
                 startupOptions.Add("COMPRESSION", "snappy");
             }
             var request = new StartupRequest(ProtocolVersion, startupOptions);
-            var tcs = new TaskCompletionSource<AbstractResponse>();
+            var tcs = new TaskCompletionSource<Response>();
             Send(request, tcs.TrySet);
             return tcs.Task;
         }
@@ -582,9 +656,9 @@ namespace Cassandra
         /// <summary>
         /// Sends a new request if possible. If it is not possible it queues it up.
         /// </summary>
-        public Task<AbstractResponse> Send(IRequest request)
+        public Task<Response> Send(IRequest request)
         {
-            var tcs = new TaskCompletionSource<AbstractResponse>();
+            var tcs = new TaskCompletionSource<Response>();
             Send(request, tcs.TrySet);
             return tcs.Task;
         }
@@ -592,13 +666,13 @@ namespace Cassandra
         /// <summary>
         /// Sends a new request if possible and executes the callback when the response is parsed. If it is not possible it queues it up.
         /// </summary>
-        public OperationState Send(IRequest request, Action<Exception, AbstractResponse> callback)
+        public OperationState Send(IRequest request, Action<Exception, Response> callback)
         {
             if (_isCanceled)
             {
                 callback(new SocketException((int)SocketError.NotConnected), null);
             }
-            var state = new OperationState(callback, Configuration.BufferPool)
+            var state = new OperationState(callback)
             {
                 Request = request
             };
@@ -696,12 +770,13 @@ namespace Cassandra
         /// Removes an operation from pending and frees the stream id
         /// </summary>
         /// <param name="streamId"></param>
-        private void RemoveFromPending(short streamId)
+        internal protected virtual OperationState RemoveFromPending(short streamId)
         {
             OperationState state;
             _pendingOperations.TryRemove(streamId, out state);
             //Set the streamId as available
             _freeOperations.Push(streamId);
+            return state;
         }
 
         /// <summary>
